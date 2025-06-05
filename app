@@ -518,11 +518,16 @@ class ImprovedDDoSAnalyzer:
 
         # For adaptive thresholds - overall traffic baseline (packets per second)
         self.traffic_baseline = {
-            'syn_packets': deque(maxlen=self.baseline_duration_seconds), # Stores {'timestamp': ..., 'count': pps}
-            'udp_packets': deque(maxlen=self.baseline_duration_seconds), # Stores {'timestamp': ..., 'count': pps}
+            'syn_packets': deque(maxlen=self.baseline_duration_seconds),
+            'udp_packets': deque(maxlen=self.baseline_duration_seconds),
+            'udp_volume': deque(maxlen=self.baseline_duration_seconds),
+            'udp_avg_size': deque(maxlen=self.baseline_duration_seconds),
+            'udp_size_var': deque(maxlen=self.baseline_duration_seconds),
         }
         self.temp_syn_count_current_second = 0
         self.temp_udp_count_current_second = 0
+        self.temp_udp_volume_current_second = 0
+        self.temp_udp_sizes_current_second = []
         self.baseline_update_lock = Lock()
         self.baseline_timer_thread = None # To control the timer thread
         self._schedule_baseline_update()
@@ -530,6 +535,7 @@ class ImprovedDDoSAnalyzer:
         # For flood detection - per-IP packet timestamps
         self.ip_syn_packet_timestamps = defaultdict(lambda: deque(maxlen=20000)) # Max packets to track per IP in window to prevent memory exhaustion
         self.ip_udp_packet_timestamps = defaultdict(lambda: deque(maxlen=20000))
+        self.ip_udp_packet_sizes = defaultdict(lambda: deque(maxlen=20000))
 
         self.whitelist = set(self.config.get('whitelist_ips', [
             '8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1', '208.67.222.222', '208.67.220.220',
@@ -545,6 +551,9 @@ class ImprovedDDoSAnalyzer:
         self.thresholds = {
             'syn_flood': self.detection_config.get('syn_flood', {}).get('base_threshold_pps', 200/60.0),
             'udp_flood': self.detection_config.get('udp_flood', {}).get('base_threshold_pps', 500/60.0),
+            'udp_volume': self.detection_config.get('udp_volume', {}).get('base_threshold', 0),
+            'udp_avg_size': self.detection_config.get('udp_avg_size', {}).get('base_threshold', 0),
+            'udp_size_var': self.detection_config.get('udp_size_var', {}).get('base_threshold', 0),
             # 'tcp_flood': 300/60.0 # If you add other types
         }
         
@@ -552,6 +561,38 @@ class ImprovedDDoSAnalyzer:
         
         logger.info("ImprovedDDoSAnalyzer инициализирован. Flood detection window: %ss", self.DETECTION_WINDOW_SECONDS)
         logger.info(f"Локальные IP адреса: {self.local_ips}")
+
+    def update_config(self, new_config: Dict[str, Any]):
+        """Update analyzer settings at runtime."""
+        with self.lock:
+            self.config.update(new_config)
+            self.detection_config.update(new_config.get('detection', {}))
+
+            self.baseline_duration_seconds = self.detection_config.get(
+                'baseline_duration_seconds', self.baseline_duration_seconds)
+            for metric in ['syn_packets', 'udp_packets', 'udp_volume', 'udp_avg_size', 'udp_size_var']:
+                self.traffic_baseline[metric] = deque(
+                    self.traffic_baseline[metric],
+                    maxlen=self.baseline_duration_seconds
+                )
+
+            self.analysis_window_seconds = self.detection_config.get(
+                'analysis_window_seconds', self.analysis_window_seconds)
+            self.DETECTION_WINDOW_SECONDS = self.detection_config.get(
+                'flood_detection_window_seconds', self.DETECTION_WINDOW_SECONDS)
+
+            self.thresholds['syn_flood'] = self.detection_config.get(
+                'syn_flood', {}).get('base_threshold_pps', self.thresholds['syn_flood'])
+            self.thresholds['udp_flood'] = self.detection_config.get(
+                'udp_flood', {}).get('base_threshold_pps', self.thresholds['udp_flood'])
+            self.thresholds['udp_volume'] = self.detection_config.get(
+                'udp_volume', {}).get('base_threshold', self.thresholds['udp_volume'])
+            self.thresholds['udp_avg_size'] = self.detection_config.get(
+                'udp_avg_size', {}).get('base_threshold', self.thresholds['udp_avg_size'])
+            self.thresholds['udp_size_var'] = self.detection_config.get(
+                'udp_size_var', {}).get('base_threshold', self.thresholds['udp_size_var'])
+
+        logger.info("Конфигурация ImprovedDDoSAnalyzer обновлена")
 
     def _get_local_ips(self) -> set:
         local_ips = set(['127.0.0.1', '::1']) # Add loopback by default
@@ -593,8 +634,26 @@ class ImprovedDDoSAnalyzer:
                 'timestamp': current_time,
                 'count': self.temp_udp_count_current_second
             })
+            self.traffic_baseline['udp_volume'].append({
+                'timestamp': current_time,
+                'count': self.temp_udp_volume_current_second
+            })
+            avg_size = (self.temp_udp_volume_current_second / self.temp_udp_count_current_second
+                        if self.temp_udp_count_current_second else 0)
+            self.traffic_baseline['udp_avg_size'].append({
+                'timestamp': current_time,
+                'count': avg_size
+            })
+            var_size = (statistics.variance(self.temp_udp_sizes_current_second)
+                        if len(self.temp_udp_sizes_current_second) > 1 else 0)
+            self.traffic_baseline['udp_size_var'].append({
+                'timestamp': current_time,
+                'count': var_size
+            })
             self.temp_syn_count_current_second = 0
             self.temp_udp_count_current_second = 0
+            self.temp_udp_volume_current_second = 0
+            self.temp_udp_sizes_current_second = []
         # logger.debug(f"Baseline updated: SYN baseline size {len(self.traffic_baseline['syn_packets'])}, UDP baseline size {len(self.traffic_baseline['udp_packets'])}")
 
 
@@ -613,11 +672,11 @@ class ImprovedDDoSAnalyzer:
         return ip in self.whitelist
     
     def calculate_adaptive_threshold(self, metric_name: str, base_threshold_pps: float) -> float:
-        baseline_data = self.traffic_baseline.get(metric_name)
-        print(str(base_threshold_pps))
+        with self.baseline_update_lock:
+            baseline_data = list(self.traffic_baseline.get(metric_name, []))
         if not baseline_data or len(baseline_data) < self.detection_config.get('min_baseline_samples', 10):
+            logger.debug("Недостаточно данных базовой линии для %s", metric_name)
             return base_threshold_pps
-
 
         recent_time_cutoff = time.time() - self.analysis_window_seconds
         recent_pps_values = [item['count'] for item in baseline_data if item['timestamp'] > recent_time_cutoff]
@@ -633,8 +692,10 @@ class ImprovedDDoSAnalyzer:
             self.detection_config.get('sensitivity', 'medium'), 2.5)
         
         adaptive_pps = mean_pps + (sensitivity_multiplier * std_dev_pps)
-        print(str(statistics.mean(recent_pps_values)) +" " + str(sensitivity_multiplier) + " " + str(std_dev_pps) + str(adaptive_pps))
-        print(str(adaptive_pps))
+        logger.debug(
+            "Adaptive threshold for %s: base=%s mean=%s std=%s multiplier=%s -> %s",
+            metric_name, base_threshold_pps, mean_pps, std_dev_pps, sensitivity_multiplier, adaptive_pps
+        )
 
         return max(adaptive_pps, base_threshold_pps)
 
@@ -660,6 +721,8 @@ class ImprovedDDoSAnalyzer:
             elif packet_info['protocol'] == 'UDP':
                 with self.baseline_update_lock: # For temp counters
                     self.temp_udp_count_current_second += 1
+                    self.temp_udp_volume_current_second += packet_info.get('size', 0)
+                    self.temp_udp_sizes_current_second.append(packet_info.get('size', 0))
                 self._check_udp_flood_advanced(src_ip, packet_info)
         except Exception as e:
             logger.error(f"Ошибка анализа пакета ({packet_info.get('src_ip')}->{packet_info.get('dst_ip')}): {e}", exc_info=True)
@@ -675,11 +738,11 @@ class ImprovedDDoSAnalyzer:
         
         count_in_window = len(timestamps)
         current_rate_pps = count_in_window / self.DETECTION_WINDOW_SECONDS
-        print("SYN IRL - " + str(current_rate_pps))
+        logger.debug("SYN rate for %s: %.2f pkt/s", ip, current_rate_pps)
         # Use adaptive threshold (which falls back to static if baseline is not ready)
         # self.thresholds['syn_flood'] is already in PPS
         adaptive_threshold_pps = self.calculate_adaptive_threshold('syn_packets', self.thresholds['syn_flood'])
-        print("SYN THRESH - " + str(adaptive_threshold_pps))
+        logger.debug("SYN threshold for %s: %.2f pkt/s", ip, adaptive_threshold_pps)
         # Attack if incoming, not whitelisted, and rate exceeds adaptive threshold
         if (packet_info.get('direction') == 'incoming' and
             not self.is_whitelisted(ip) and 
@@ -703,20 +766,36 @@ class ImprovedDDoSAnalyzer:
     def _check_udp_flood_advanced(self, ip, packet_info):
         current_time = time.time()
         timestamps = self.ip_udp_packet_timestamps[ip]
+        sizes = self.ip_udp_packet_sizes[ip]
         timestamps.append(current_time)
+        sizes.append((current_time, packet_info.get('size', 0)))
 
         while timestamps and timestamps[0] < current_time - self.DETECTION_WINDOW_SECONDS:
             timestamps.popleft()
-        
+        while sizes and sizes[0][0] < current_time - self.DETECTION_WINDOW_SECONDS:
+            sizes.popleft()
+
         count_in_window = len(timestamps)
         current_rate_pps = count_in_window / self.DETECTION_WINDOW_SECONDS
-        print("UDP IRL - " + str(current_rate_pps))
+        logger.debug("UDP rate for %s: %.2f pkt/s", ip, current_rate_pps)
         adaptive_threshold_pps = self.calculate_adaptive_threshold('udp_packets', self.thresholds['udp_flood'])
-        print("UDP THRESH - " + str(adaptive_threshold_pps))
+        logger.debug("UDP threshold for %s: %.2f pkt/s", ip, adaptive_threshold_pps)
+        size_values = [s for _, s in sizes]
+        volume = sum(size_values)
+        avg_size = statistics.mean(size_values) if size_values else 0
+        var_size = statistics.variance(size_values) if len(size_values) > 1 else 0
+
+        volume_thresh = self.calculate_adaptive_threshold('udp_volume', self.thresholds['udp_volume'])
+        avg_size_thresh = self.calculate_adaptive_threshold('udp_avg_size', self.thresholds['udp_avg_size'])
+        var_size_thresh = self.calculate_adaptive_threshold('udp_size_var', self.thresholds['udp_size_var'])
+
         if (packet_info.get('direction') == 'incoming' and
             not self.is_whitelisted(ip) and
-            current_rate_pps > adaptive_threshold_pps):
-            
+            (current_rate_pps > adaptive_threshold_pps or
+             volume > volume_thresh or
+             avg_size > avg_size_thresh or
+             var_size > var_size_thresh)):
+
             alert = {
                 'timestamp': datetime.now(),
                 'type': 'UDP Flood',
@@ -724,9 +803,19 @@ class ImprovedDDoSAnalyzer:
                 'severity': 'High',
                 'count': count_in_window,
                 'rate_info': f"{current_rate_pps:.1f} pkt/s over {self.DETECTION_WINDOW_SECONDS}s",
+                'volume': volume,
+                'avg_size': avg_size,
+                'size_variance': var_size,
                 'direction': packet_info.get('direction', 'unknown'),
-                'description': f'UDP Flood с IP {ip} ({current_rate_pps:.1f} pkt/s, порог {adaptive_threshold_pps:.1f} pkt/s)',
-                'used_threshold_pps': adaptive_threshold_pps
+                'description': (
+                    f'UDP Flood с IP {ip} ({current_rate_pps:.1f} pkt/s, порог '
+                    f'{adaptive_threshold_pps:.1f} pkt/s, объём {volume} байт, '
+                    f'средний размер {avg_size:.1f}, дисперсия {var_size:.1f})'
+                ),
+                'used_threshold_pps': adaptive_threshold_pps,
+                'used_volume_thresh': volume_thresh,
+                'used_avg_size_thresh': avg_size_thresh,
+                'used_var_thresh': var_size_thresh
             }
             self._trigger_alert(alert)
             with self.lock:
